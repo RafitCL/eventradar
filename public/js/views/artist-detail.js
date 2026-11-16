@@ -1,0 +1,619 @@
+import { getArtistDetails, getArtistLyrics, searchArtist, getCurrentUser, getAffinityProfile, getAccount, apiRequest, getArtistFavorites, setArtistFavorite, isArtistFavorite } from '../api.js';
+import { SegmentedControl } from '../components/segmented.js';
+import { previewPlayer } from '../preview-player.js';
+import {
+  avatarUrl,
+  emptyState,
+  escapeHtml,
+  formatDuration,
+  safeHttpUrl
+} from '../utils.js';
+
+function formatFollowers(value) {
+  if (!Number.isFinite(Number(value))) return '—';
+  return new Intl.NumberFormat('es-ES', { notation: 'compact', maximumFractionDigits: 1 }).format(Number(value));
+}
+
+export class ArtistDetailView {
+  constructor(container, props = {}) {
+    this.container = container;
+    this.artistId = props.artistId || null;
+    this.artist = null;
+    this.genius = null;
+    this.geniusError = null;
+    this.error = null;
+    this.activeTab = 'lyrics';
+    this.selectedTrack = null;
+    this.artistFavorite = false;
+    this.lyrics = null;
+    this.lyricsError = null;
+    this.lyricsSource = null;
+    this.lyricsSynced = false;
+    this.lyricsSyncedText = null;
+    this.lyricsLoading = false;
+    this.lyricsRequest = 0;
+    this.segmented = null;
+    this.handleClick = this.handleClick.bind(this);
+    this.handleSubmit = this.handleSubmit.bind(this);
+    this.handleKeydown = this.handleKeydown.bind(this);
+    this.handleTimeUpdate = this.handleTimeUpdate.bind(this);
+  }
+
+  async render() {
+    this.container.innerHTML = `
+      <div class="artist-page">
+        <main class="artist-main">
+          <div id="artistContent">
+            <div class="view-loading" role="status"><span class="material-symbols-outlined">progress_activity</span><span>Cargando artista…</span></div>
+          </div>
+        </main>
+      </div>
+    `;
+    this.container.addEventListener('click', this.handleClick);
+    this.container.addEventListener('submit', this.handleSubmit);
+    this.container.addEventListener('keydown', this.handleKeydown);
+    previewPlayer.audio.addEventListener('timeupdate', this.handleTimeUpdate);
+
+    if (!this.artistId) {
+      this.renderSearch();
+      return;
+    }
+    await this.loadArtist();
+  }
+
+  renderSearch(message = '') {
+    const content = this.container.querySelector('#artistContent');
+    if (!content) return;
+    content.innerHTML = `
+      <section class="artist-search-shell">
+        <span class="welcome-kicker"><span class="material-symbols-outlined">mic</span> Artistas</span>
+        <h1>Encuentra un artista real en Deezer</h1>
+        <p>Busca por nombre para ver su ficha, sus canciones más escuchadas y su discografía.</p>
+        ${message ? `<p class="artist-search-error" role="alert">${escapeHtml(message)}</p>` : ''}
+        <form id="artistSearchForm" class="artist-search-form">
+          <label for="artistSearchInput">Nombre del artista</label>
+          <div>
+            <input id="artistSearchInput" name="name" type="search" placeholder="Ej. Coldplay" autocomplete="off" required>
+            <button class="welcome-login" type="submit"><span class="material-symbols-outlined">search</span> Buscar</button>
+          </div>
+        </form>
+        <div id="artistSearchResults" class="artist-search-results"></div>
+        <section class="artist-favorites" id="artistFavorites">
+          <h2>Tus artistas favoritos</h2>
+          <div id="artistFavoritesList" class="artist-search-results"></div>
+        </section>
+      </section>
+    `;
+    content.querySelector('#artistSearchInput')?.focus();
+    this.loadFavoriteArtists();
+  }
+
+  async loadFavoriteArtists() {
+    const list = this.container.querySelector('#artistFavoritesList');
+    if (!list) return;
+    list.innerHTML = '<div class="view-loading" role="status"><span class="material-symbols-outlined">progress_activity</span><span>Cargando tus artistas…</span></div>';
+
+    let artists = [];
+    let tastes = [];
+    try {
+      const user = await getCurrentUser();
+      const account = await getAccount();
+      const hasAccess = Boolean(user) || Boolean(account);
+      if (hasAccess) {
+        if (user) {
+          const affinity = await getAffinityProfile();
+          artists = affinity?.topArtists || [];
+          try {
+            const tasteData = await apiRequest('/api/tastes');
+            tastes = Array.isArray(tasteData?.tastes) ? tasteData.tastes.map((item) => String(item.nombre || item).toLowerCase()) : [];
+          } catch {
+            tastes = [];
+          }
+        }
+        // Favoritos guardados manualmente en la BD.
+        const favoriteNames = await getArtistFavorites();
+        const favoriteArtists = favoriteNames.map((name) => ({ name, genres: [] }));
+        // Evitar duplicados por nombre.
+        const existingNames = new Set(artists.map((a) => String(a.name).toLowerCase()));
+        favoriteArtists.forEach((fav) => {
+          if (!existingNames.has(String(fav.name).toLowerCase())) {
+            artists.unshift(fav);
+            existingNames.add(String(fav.name).toLowerCase());
+          }
+        });
+      }
+    } catch {
+      artists = [];
+    }
+
+    if (tastes.length > 0) {
+      const filtered = artists.filter((artist) => {
+        const genres = (artist.genres || []).map((genre) => String(genre).toLowerCase());
+        return tastes.some((taste) => genres.some((genre) => genre.includes(taste) || taste.includes(genre)));
+      });
+      if (filtered.length > 0) artists = filtered;
+    }
+
+    if (artists.length === 0) {
+      list.innerHTML = emptyState({
+        icon: 'person_search',
+        title: 'Sin artistas favoritos',
+        message: 'Conecta Last.fm o busca artistas para verlos aquí.'
+      });
+      return;
+    }
+
+    list.innerHTML = artists.slice(0, 12).map((artist) => `
+      <a class="artist-search-result" href="#/artista/${encodeURIComponent(artist.name)}">
+        <span class="artist-search-avatar"><span class="material-symbols-outlined">person</span></span>
+        <span><strong>${escapeHtml(artist.name)}</strong><small>${escapeHtml((artist.genres || []).slice(0, 2).join(' · ') || 'Artista de tu perfil')}</small></span>
+        <span class="material-symbols-outlined">chevron_right</span>
+      </a>
+    `).join('');
+  }
+
+  async loadArtist() {
+    const result = await getArtistDetails(this.artistId);
+    this.artist = result.artist;
+    this.genius = result.genius || null;
+    this.geniusError = result.geniusError || null;
+    this.error = result.error || null;
+
+    if (!this.artist) {
+      this.renderSearch(this.error?.message || 'No se pudo cargar el artista en Deezer.');
+      return;
+    }
+    this.artistFavorite = await isArtistFavorite(this.artist.name);
+    this.renderArtist();
+  }
+
+  renderArtist() {
+    const content = this.container.querySelector('#artistContent');
+    if (!content) return;
+    const artist = this.artist;
+    const image = safeHttpUrl(artist.image) || avatarUrl([], artist.name);
+    const deezerUrl = safeHttpUrl(artist.externalUrl);
+    const genres = (artist.genres || []).slice(0, 4);
+    const followers = formatFollowers(artist.followers);
+    const hasPopularity = Number.isFinite(Number(artist.popularity));
+
+    content.innerHTML = `
+      <section class="artist-hero">
+        <div class="artist-hero-glow"></div>
+        <div class="artist-hero-left">
+          <div class="artist-hero-avatar">
+            <img src="${escapeHtml(image)}" alt="${escapeHtml(artist.name)}" class="artist-hero-avatar-img">
+            <span class="artist-hero-verified" title="Datos de Deezer"><span class="material-symbols-outlined">verified</span></span>
+          </div>
+          <div class="artist-hero-info">
+            <div class="artist-hero-name-row">
+              <h1 class="artist-hero-name">${escapeHtml(artist.name)}</h1>
+              <button class="artist-favorite-btn ${this.artistFavorite ? 'active' : ''}" type="button" data-action="toggle-artist-favorite" aria-label="Marcar como favorito" title="Marcar como favorito" style="color:${this.artistFavorite ? '#ff2d55' : 'rgba(255,255,255,0.55)'}">
+                <span class="material-symbols-outlined">${this.artistFavorite ? 'favorite' : 'favorite_border'}</span>
+              </button>
+              ${hasPopularity ? `<span class="artist-hero-badge">Popularidad ${escapeHtml(String(artist.popularity))}/100</span>` : ''}
+            </div>
+            <div class="artist-hero-meta">
+              ${genres.length ? genres.map((genre) => `<span class="affinity-artist-chip">${escapeHtml(genre)}</span>`).join('') : '<span class="artist-hero-meta-item">Sin géneros disponibles.</span>'}
+            </div>
+            <div class="artist-hero-meta">
+              <span class="artist-hero-meta-item"><span class="material-symbols-outlined">groups</span>${followers} seguidores</span>
+              ${deezerUrl ? `<a class="artist-hero-meta-item" href="${escapeHtml(deezerUrl)}" target="_blank" rel="noopener noreferrer"><span class="material-symbols-outlined">open_in_new</span>Abrir en Deezer</a>` : ''}
+            </div>
+          </div>
+        </div>
+        <div class="artist-hero-badges">
+          <div class="artist-hero-stat blue"><span class="material-symbols-outlined">library_music</span><div class="artist-hero-stat-info"><span class="artist-hero-stat-value">${artist.albums?.length || 0}</span><span class="artist-hero-stat-label">Álbumes y singles</span></div></div>
+          <div class="artist-hero-stat pink"><span class="material-symbols-outlined">graphic_eq</span><div class="artist-hero-stat-info"><span class="artist-hero-stat-value">${artist.topTracks?.length || 0}</span><span class="artist-hero-stat-label">Top canciones</span></div></div>
+        </div>
+      </section>
+
+      <div id="artistTabs" class="artist-tabs"></div>
+      <div id="artistTabContent"></div>
+    `;
+
+    this.segmented = new SegmentedControl(content.querySelector('#artistTabs'), {
+      items: [
+        { label: 'Letras', value: 'lyrics' },
+        { label: 'Discografía', value: 'albums' },
+        { label: 'Biografía', value: 'bio' }
+      ],
+      activeIndex: 0,
+      onChange: (index, item) => {
+        this.activeTab = item.value;
+        this.renderTabContent();
+      }
+    });
+
+    this.selectedTrack = this.artist.topTracks?.[0] || null;
+    this.renderTabContent();
+    if (this.selectedTrack) this.loadLyrics();
+  }
+
+  renderTabContent() {
+    const content = this.container.querySelector('#artistTabContent');
+    if (!content) return;
+
+    if (this.activeTab === 'albums') {
+      content.innerHTML = this.renderAlbums();
+      return;
+    }
+    if (this.activeTab === 'bio') {
+      content.innerHTML = this.renderBiography();
+      return;
+    }
+    content.innerHTML = this.renderLyricsTab();
+  }
+
+  renderLyricsTab() {
+    const tracks = this.artist.topTracks || [];
+    if (tracks.length === 0) {
+      return emptyState({
+        icon: 'music_off',
+        title: 'Sin canciones disponibles',
+        message: 'Deezer no devolvió canciones populares para este artista.'
+      });
+    }
+
+    return `
+      <div class="artist-grid">
+        <div class="artist-main-col">
+          <section class="artist-sing-panel">
+            <div class="artist-sing-glow"></div>
+            <div class="artist-sing-header">
+              <div class="artist-sing-status"><span class="artist-sing-dot"></span><span class="artist-sing-label" id="lyricsSourceLabel">Letra · LRCLIB</span></div>
+              ${this.selectedTrack ? `<span class="artist-hero-badge">${escapeHtml(this.selectedTrack.name)}</span>` : ''}
+            </div>
+            <div id="lyricsPanel">${this.renderLyricsPanel()}</div>
+          </section>
+        </div>
+        <aside class="artist-side-col">
+          <section class="artist-playlist">
+            <div class="artist-playlist-header">
+              <span class="material-symbols-outlined">queue_music</span>
+              <span>Top canciones en Deezer</span>
+            </div>
+            ${tracks.map((track, index) => `
+              <div class="artist-playlist-item ${this.selectedTrack?.id === track.id ? 'active' : ''}" data-track-index="${index}" role="button" tabindex="0">
+                <div class="artist-playlist-item-left">
+                  <span class="artist-playlist-item-icon ${this.selectedTrack?.id === track.id ? 'active' : ''}"><span class="material-symbols-outlined">${this.selectedTrack?.id === track.id ? 'graphic_eq' : 'music_note'}</span></span>
+                  <div class="artist-playlist-item-info">
+                    <span class="artist-playlist-item-name">${escapeHtml(track.name)}</span>
+                    <span class="artist-playlist-item-artist">${escapeHtml((track.artists || []).map((item) => item.name).join(', ') || this.artist.name)}</span>
+                  </div>
+                </div>
+                <div class="artist-playlist-item-right">
+                  <span class="artist-playlist-item-duration">${escapeHtml(formatDuration(track.durationMs))}</span>
+                  <button class="artist-playlist-item-play" type="button" data-play-index="${index}" aria-label="Reproducir vista previa de ${escapeHtml(track.name)}" ${track.previewUrl ? '' : 'disabled title="Deezer no ofrece vista previa para esta canción"'}>
+                    <span class="material-symbols-outlined">${track.previewUrl ? 'play_arrow' : 'block'}</span>
+                  </button>
+                </div>
+              </div>
+            `).join('')}
+          </section>
+        </aside>
+      </div>
+    `;
+  }
+
+  renderLyricsPanel() {
+    if (!this.selectedTrack) {
+      return emptyState({ icon: 'lyrics', title: 'Elige una canción', message: 'Selecciona una canción para intentar cargar su letra.' });
+    }
+    if (this.lyricsLoading) {
+      return '<div class="view-loading" role="status"><span class="material-symbols-outlined">progress_activity</span><span>Cargando letra…</span></div>';
+    }
+    if (this.lyricsError) {
+      return emptyState({
+        icon: 'lyrics',
+        title: 'Letra no disponible',
+        message: this.lyricsError.message || 'No se pudo cargar la letra.',
+        action: '<button class="event-card-ref-btn glass" type="button" data-action="retry-lyrics">Reintentar</button>'
+      });
+    }
+    if (!this.lyrics) {
+      return emptyState({
+        icon: 'lyrics',
+        title: 'Sin letra cargada',
+        message: 'Selecciona una canción para cargar su letra.'
+      });
+    }
+
+    const sourceNote = `Letra completa proporcionada por LRCLIB de forma gratuita${this.lyricsSynced ? ' (también disponible en versión sincronizada)' : ''}.`;
+
+    const syncedLines = this.parseSyncedLyrics(this.lyricsSyncedText);
+    const lyricsHtml = syncedLines.length > 0
+      ? syncedLines.map((line) => `<span class="artist-lyrics-line" data-time="${line.time}">${escapeHtml(line.text || ' ')}</span>`).join('')
+      : escapeHtml(this.lyrics || '').replace(/\n/g, '<br>');
+
+    return `
+      <div class="artist-lyrics-text">${lyricsHtml}</div>
+      ${this.lyricsDisclaimer ? `<p class="artist-lyrics-disclaimer">${escapeHtml(this.lyricsDisclaimer)}</p>` : ''}
+      <p class="artist-lyrics-disclaimer">${sourceNote}${this.lyricsSynced ? ' Se resalta la línea según el tiempo del preview (aproximado).' : ''}</p>
+    `;
+  }
+
+  renderAlbums() {
+    const albums = this.artist.albums || [];
+    if (albums.length === 0) {
+      return emptyState({
+        icon: 'album',
+        title: 'Sin discografía disponible',
+        message: 'Deezer no devolvió álbumes ni singles para este artista.'
+      });
+    }
+    return `
+      <div class="artist-albums-grid">
+        ${albums.map((album) => {
+          const image = safeHttpUrl(album.image);
+          const url = safeHttpUrl(album.externalUrl);
+          const tag = url ? 'a' : 'div';
+          const attrs = url ? `href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer"` : '';
+          return `
+            <${tag} class="artist-album-card" ${attrs}>
+              ${image ? `<img src="${escapeHtml(image)}" alt="${escapeHtml(album.name)}" loading="lazy">` : `<div class="event-image-fallback"><span class="material-symbols-outlined">album</span></div>`}
+              <span class="artist-album-name">${escapeHtml(album.name)}</span>
+              <span class="artist-album-meta">${escapeHtml(album.type || 'Álbum')}${album.releaseDate ? ` · ${escapeHtml(album.releaseDate.slice(0, 4))}` : ''}</span>
+            </${tag}>
+          `;
+        }).join('')}
+      </div>
+    `;
+  }
+
+  renderBiography() {
+    const description = this.genius?.description;
+    const geniusUrl = safeHttpUrl(this.genius?.url);
+    if (!description) {
+      return emptyState({
+        icon: 'menu_book',
+        title: 'Biografía no disponible',
+        message: this.geniusError?.message || 'Genius no devolvió una biografía para este artista.',
+        action: geniusUrl ? `<a class="event-card-ref-btn glass" href="${escapeHtml(geniusUrl)}" target="_blank" rel="noopener noreferrer">Abrir en Genius</a>` : ''
+      });
+    }
+    return `
+      <section class="artist-bio">
+        <h2>Biografía</h2>
+        <p>${escapeHtml(description)}</p>
+        ${geniusUrl ? `<a class="route-action-btn" href="${escapeHtml(geniusUrl)}" target="_blank" rel="noopener noreferrer"><span class="material-symbols-outlined">open_in_new</span> Leer en Genius</a>` : ''}
+        <div class="artist-bio-stats">
+          <span><strong>${formatFollowers(this.artist.followers)}</strong> seguidores en Deezer</span>
+          <span><strong>${this.artist.albums?.length || 0}</strong> álbumes y singles</span>
+        </div>
+      </section>
+    `;
+  }
+
+  async loadLyrics() {
+    if (!this.selectedTrack || !this.artist) return;
+    const requestId = ++this.lyricsRequest;
+    this.lyricsLoading = true;
+    this.lyricsError = null;
+    this.lyrics = null;
+    this.lyricsSource = null;
+    this.lyricsSynced = false;
+    this.lyricsSyncedText = null;
+    this.updateLyricsPanel();
+
+    const result = await getArtistLyrics(this.artist.name, this.selectedTrack.name);
+    if (requestId !== this.lyricsRequest) return;
+    this.lyricsLoading = false;
+    this.lyrics = result.lyrics || null;
+    this.lyricsDisclaimer = result.disclaimer || null;
+    this.lyricsSource = result.source || 'lrclib';
+    this.lyricsSynced = Boolean(result.syncedLyrics);
+    this.lyricsSyncedText = result.syncedLyrics || null;
+    this.lyricsError = result.error ? result.error : null;
+    this.updateLyricsPanel();
+  }
+
+  updateLyricsPanel() {
+    const panel = this.container.querySelector('#lyricsPanel');
+    if (panel) panel.innerHTML = this.renderLyricsPanel();
+    const sourceLabel = this.container.querySelector('#lyricsSourceLabel');
+    if (sourceLabel) {
+      sourceLabel.textContent = 'Letra · LRCLIB';
+    }
+  }
+
+  parseSyncedLyrics(text) {
+    if (!text) return [];
+    const lines = [];
+    const regex = /^\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\]\s?(.*)$/;
+    for (const raw of String(text).split('\\n')) {
+      const match = raw.match(regex);
+      if (!match) continue;
+      const minutes = Number(match[1]);
+      const seconds = Number(match[2]);
+      const ms = match[3] ? Number(match[3].padEnd(3, '0')) : 0;
+      const time = minutes * 60 + seconds + ms / 1000;
+      lines.push({ time, text: match[4] || '' });
+    }
+    return lines;
+  }
+
+  handleTimeUpdate() {
+    const lines = this.container.querySelectorAll('.artist-lyrics-line');
+    if (!lines.length || !this.lyricsSyncedText) return;
+
+    const currentTrack = previewPlayer.currentTrack;
+    const selectedTrack = this.selectedTrack;
+    const isMatching = Boolean(
+      currentTrack && selectedTrack
+      && currentTrack.previewUrl && currentTrack.previewUrl === selectedTrack.previewUrl
+      && previewPlayer.isPlaying
+    );
+
+    if (!isMatching) {
+      lines.forEach((line) => line.classList.remove('active'));
+      return;
+    }
+
+    const parsed = this.parseSyncedLyrics(this.lyricsSyncedText);
+    if (parsed.length === 0) return;
+
+    const currentTime = previewPlayer.audio.currentTime || 0;
+    let activeIndex = -1;
+    for (let i = 0; i < parsed.length; i += 1) {
+      if (parsed[i].time <= currentTime) activeIndex = i;
+      else break;
+    }
+
+    lines.forEach((line, index) => {
+      line.classList.toggle('active', index === activeIndex);
+    });
+
+    if (activeIndex >= 0 && lines[activeIndex]) {
+      const parent = this.container.querySelector('.artist-lyrics-text');
+      const activeLine = lines[activeIndex];
+      if (parent) {
+        const parentRect = parent.getBoundingClientRect();
+        const lineRect = activeLine.getBoundingClientRect();
+        if (lineRect.top < parentRect.top || lineRect.bottom > parentRect.bottom) {
+          activeLine.scrollIntoView({ block: 'nearest' });
+        }
+      }
+    }
+  }
+
+  selectTrack(index) {
+    const track = this.artist.topTracks?.[index];
+    if (!track) return;
+    this.selectedTrack = track;
+    this.activeTab = 'lyrics';
+    this.segmented?.setActive(0);
+    this.renderTabContent();
+    this.loadLyrics();
+  }
+
+  async runSearch(name) {
+    const results = this.container.querySelector('#artistSearchResults');
+    if (!results) return;
+    if (!name.trim()) return;
+    results.innerHTML = '<div class="view-loading" role="status"><span class="material-symbols-outlined">progress_activity</span><span>Buscando en Deezer…</span></div>';
+    const response = await searchArtist(name);
+    if (response.error) {
+      results.innerHTML = emptyState({
+        icon: 'search_off',
+        title: 'No se pudo buscar',
+        message: response.error.message
+      });
+      return;
+    }
+    if (!response.artists?.length) {
+      results.innerHTML = emptyState({
+        icon: 'person_search',
+        title: 'Sin resultados',
+        message: 'Deezer no encontró artistas con ese nombre.'
+      });
+      return;
+    }
+
+    const favorites = await getArtistFavorites();
+    const favoriteSet = new Set(favorites.map((item) => String(item).toLowerCase()));
+
+    results.innerHTML = response.artists.map((artist) => {
+      const image = safeHttpUrl(artist.image);
+      const isFavorite = favoriteSet.has(String(artist.name).toLowerCase());
+      return `
+        <a class="artist-search-result" href="#/artista/${encodeURIComponent(artist.id)}">
+          ${image ? `<img src="${escapeHtml(image)}" alt="" loading="lazy">` : `<span class="artist-search-avatar"><span class="material-symbols-outlined">person</span></span>`}
+          <span><strong>${escapeHtml(artist.name)}</strong><small>${escapeHtml((artist.genres || []).slice(0, 2).join(' · ') || 'Artista de Deezer')}</small></span>
+          <span class="material-symbols-outlined">chevron_right</span>
+          <button type="button" class="artist-favorite-btn ${isFavorite ? 'active' : ''}" data-action="toggle-search-favorite" data-artist-name="${escapeHtml(artist.name)}" aria-label="Marcar como favorito" style="color:${isFavorite ? '#ff2d55' : 'rgba(255,255,255,0.55)'}">
+            <span class="material-symbols-outlined">${isFavorite ? 'favorite' : 'favorite_border'}</span>
+          </button>
+        </a>
+      `;
+    }).join('');
+  }
+
+  handleKeydown(event) {
+    if (!['Enter', ' '].includes(event.key)) return;
+    const row = event.target.closest('[data-track-index]');
+    if (!row || event.target.closest('[data-play-index]')) return;
+    event.preventDefault();
+    this.selectTrack(Number(row.getAttribute('data-track-index')));
+  }
+
+  handleClick(event) {
+    const searchFavoriteBtn = event.target.closest('[data-action="toggle-search-favorite"]');
+    if (searchFavoriteBtn) {
+      event.preventDefault();
+      event.stopPropagation();
+      const name = searchFavoriteBtn.getAttribute('data-artist-name');
+      const icon = searchFavoriteBtn.querySelector('.material-symbols-outlined');
+      const currentlyFavorite = icon?.textContent === 'favorite';
+      const next = !currentlyFavorite;
+      if (icon) icon.textContent = next ? 'favorite' : 'favorite_border';
+      searchFavoriteBtn.classList.toggle('active', next);
+      searchFavoriteBtn.style.color = next ? '#ff2d55' : 'rgba(255,255,255,0.55)';
+      setArtistFavorite(name, next).then(() => this.loadFavoriteArtists());
+      return;
+    }
+
+    const favoriteBtn = event.target.closest('[data-action="toggle-artist-favorite"]');
+    if (favoriteBtn) {
+      event.stopPropagation();
+      this.toggleArtistFavorite();
+      return;
+    }
+
+    const play = event.target.closest('[data-play-index]');
+    if (play) {
+      event.stopPropagation();
+      const index = Number(play.getAttribute('data-play-index'));
+      const track = this.artist?.topTracks?.[index];
+      if (track?.previewUrl) {
+        previewPlayer.playTrack({
+          name: track.name,
+          artist: this.artist.name,
+          previewUrl: track.previewUrl,
+          externalUrl: track.externalUrl
+        });
+      }
+      return;
+    }
+
+    const row = event.target.closest('[data-track-index]');
+    if (row) {
+      this.selectTrack(Number(row.getAttribute('data-track-index')));
+      return;
+    }
+
+    if (event.target.closest('[data-action="retry-lyrics"]')) {
+      this.loadLyrics();
+    }
+  }
+
+  handleSubmit(event) {
+    if (event.target.id !== 'artistSearchForm') return;
+    event.preventDefault();
+    const input = event.target.querySelector('input[name="name"]');
+    this.runSearch(input?.value || '');
+  }
+
+  async toggleArtistFavorite() {
+    if (!this.artist) return;
+    this.artistFavorite = !this.artistFavorite;
+    await setArtistFavorite(this.artist.name, this.artistFavorite);
+    const btn = this.container.querySelector('[data-action="toggle-artist-favorite"] .material-symbols-outlined');
+    if (btn) btn.textContent = this.artistFavorite ? 'favorite' : 'favorite_border';
+    const btnEl = this.container.querySelector('[data-action="toggle-artist-favorite"]');
+    if (btnEl) {
+      btnEl.title = this.artistFavorite ? 'Quitar de favoritos' : 'Marcar como favorito';
+      btnEl.classList.toggle('active', this.artistFavorite);
+      btnEl.style.color = this.artistFavorite ? '#ff2d55' : 'rgba(255,255,255,0.55)';
+    }
+  }
+
+  destroy() {
+    this.container.removeEventListener('click', this.handleClick);
+    this.container.removeEventListener('submit', this.handleSubmit);
+    this.container.removeEventListener('keydown', this.handleKeydown);
+    previewPlayer.audio.removeEventListener('timeupdate', this.handleTimeUpdate);
+    this.segmented?.destroy();
+    this.segmented = null;
+  }
+}
